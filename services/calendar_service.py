@@ -237,9 +237,6 @@ def create_appointment(appointment: dict) -> Optional[dict]:
                 "conferenceSolutionKey": {
                     "type": "hangoutsMeet"
                 },
-                "status": {
-                    "statusCode": "success"
-                }
             }
         },
         "reminders": {
