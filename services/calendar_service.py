@@ -1,8 +1,8 @@
+import hashlib
 import os
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from uuid import uuid4
 from typing import Optional
 
 from google.oauth2 import service_account
@@ -164,6 +164,17 @@ def find_existing_appointment(appointment: dict) -> Optional[dict]:
     return None
 
 
+def _meet_request_id(phone: str, date: str, time: str) -> str:
+    """
+    Derive a stable, unique requestId for the Google Meet createRequest.
+    Same phone + date + time always produces the same ID (idempotent retries).
+    Different appointments always produce different IDs.
+    Max 128 chars; we produce 'meet-' + 40 hex = 45 chars.
+    """
+    key = f"{phone}|{date}|{time}"
+    return "meet-" + hashlib.sha1(key.encode()).hexdigest()
+
+
 def create_appointment(appointment: dict) -> Optional[dict]:
     """
     Create a Google Calendar event with a Google Meet link.
@@ -214,10 +225,15 @@ def create_appointment(appointment: dict) -> Optional[dict]:
             "dateTime": end_dt.isoformat(),
             "timeZone": _get_timezone(),
         },
-        # Automatically generate a Google Meet link
+        # Google Meet link — requestId is derived from phone+slot so it is
+        # stable across retries (idempotent) and unique per appointment.
         "conferenceData": {
             "createRequest": {
-                "requestId": f"apt-{uuid4().hex}",
+                "requestId": _meet_request_id(
+                    appointment.get("whatsapp_phone", ""),
+                    appointment["appointment_date"],
+                    appointment["start_time"],
+                ),
                 "conferenceSolutionKey": {"type": "hangoutsMeet"},
             }
         },
