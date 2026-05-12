@@ -234,7 +234,12 @@ def create_appointment(appointment: dict) -> Optional[dict]:
                     appointment["appointment_date"],
                     appointment["start_time"],
                 ),
-                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                "conferenceSolutionKey": {
+                    "type": "hangoutsMeet"
+                },
+                "status": {
+                    "statusCode": "success"
+                }
             }
         },
         "reminders": {
