@@ -12,7 +12,10 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/calendar.events",
+]
 
 
 def _get_timezone() -> str:
@@ -31,17 +34,20 @@ SERVICE_DISPLAY_NAMES = {
 
 
 def _get_calendar_service():
-    """Build an authenticated Google Calendar service instance."""
+    """
+    Build a Google Calendar service using Domain-Wide Delegation.
+    The service account impersonates GOOGLE_DELEGATED_USER so the API acts
+    as that real Workspace user — required for Google Meet link generation.
+    """
+    delegated_user = os.environ.get("GOOGLE_DELEGATED_USER", "andres@zerocode.la")
     service_account_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
 
     if service_account_json:
-        # Production: credentials from environment variable (JSON string)
         info = json.loads(service_account_json)
         credentials = service_account.Credentials.from_service_account_info(
             info, scopes=SCOPES
         )
     else:
-        # Local development: fall back to JSON file in project root
         file_path = os.environ.get(
             "GOOGLE_SERVICE_ACCOUNT_FILE",
             "whatsapp-calendar-agent-496013-c12f3ed285d4.json",
@@ -50,7 +56,9 @@ def _get_calendar_service():
             file_path, scopes=SCOPES
         )
 
-    return build("calendar", "v3", credentials=credentials)
+    # Impersonate the Workspace user — this is what makes Meet links work
+    delegated_credentials = credentials.with_subject(delegated_user)
+    return build("calendar", "v3", credentials=delegated_credentials)
 
 
 def _parse_local_datetime(date_str: str, time_str: str) -> datetime:
@@ -92,7 +100,7 @@ def check_availability(appointment: dict) -> bool:
     Return True if the time slot is free, False if there is a scheduling conflict.
     Uses the Google Calendar FreeBusy API.
     """
-    calendar_id = os.environ.get("GOOGLE_CALENDAR_ID")
+    calendar_id = "primary"
     service = _get_calendar_service()
 
     start_dt = _parse_local_datetime(
@@ -134,7 +142,7 @@ def find_existing_appointment(appointment: dict) -> Optional[dict]:
     if not phone:
         return None
 
-    calendar_id = os.environ.get("GOOGLE_CALENDAR_ID")
+    calendar_id = "primary"
     service = _get_calendar_service()
 
     start_dt = _parse_local_datetime(
@@ -175,6 +183,46 @@ def _meet_request_id(phone: str, date: str, time: str) -> str:
     return "meet-" + hashlib.sha1(key.encode()).hexdigest()
 
 
+def create_event(summary: str, start_datetime: str, end_datetime: str) -> dict:
+    """
+    Reusable function to create a Calendar event with a Google Meet link.
+    Authenticates via Domain-Wide Delegation, inserts into the primary calendar.
+
+    Args:
+        summary:        Event title string.
+        start_datetime: ISO 8601 string, e.g. "2026-05-20T10:00:00-05:00"
+        end_datetime:   ISO 8601 string, e.g. "2026-05-20T11:00:00-05:00"
+
+    Returns:
+        {"id": "<event_id>", "link": "<htmlLink>"}
+    """
+    service = _get_calendar_service()
+
+    event_body = {
+        "summary": summary,
+        "start": {"dateTime": start_datetime, "timeZone": _get_timezone()},
+        "end":   {"dateTime": end_datetime,   "timeZone": _get_timezone()},
+        "conferenceData": {
+            "createRequest": {
+                "requestId": "meet-" + hashlib.sha1(
+                    f"{summary}|{start_datetime}".encode()
+                ).hexdigest(),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                "status": {"statusCode": "success"},
+            }
+        },
+    }
+
+    created = (
+        service.events()
+        .insert(calendarId="primary", body=event_body, conferenceDataVersion=1)
+        .execute()
+    )
+
+    logger.info(f"create_event: id={created.get('id')} link={created.get('htmlLink')}")
+    return {"id": created.get("id"), "link": created.get("htmlLink")}
+
+
 def create_appointment(appointment: dict) -> Optional[dict]:
     """
     Create a Google Calendar event with a Google Meet link.
@@ -187,7 +235,7 @@ def create_appointment(appointment: dict) -> Optional[dict]:
         logger.info("Returning existing event — no duplicate created")
         return existing
 
-    calendar_id = os.environ.get("GOOGLE_CALENDAR_ID")
+    calendar_id = "primary"
     service = _get_calendar_service()
 
     start_dt = _parse_local_datetime(
