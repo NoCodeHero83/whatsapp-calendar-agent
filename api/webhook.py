@@ -1,19 +1,19 @@
 """
-WhatsApp → OpenAI → Google Calendar webhook.
-Handles Meta webhook verification (GET) and stateful appointment booking (POST).
+WhatsApp → OpenAI → Lead Qualification webhook.
+Handles Meta webhook verification (GET) and stateful lead qualification (POST).
 
 Hardening:
 - POST always returns HTTP 200 immediately; processing runs in a background thread.
 - WhatsApp message IDs are deduplicated via SQLite to survive Meta retries.
 - Conversation state is persisted in SQLite and survives server restarts.
-- Calendar events are tagged with the sender's phone to prevent duplicate creation.
+- Google Calendar remains connected but is NOT used during qualification.
 """
 
 import os
 import sys
 import json
-import asyncio
 from pathlib import Path
+from datetime import datetime
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
@@ -23,13 +23,7 @@ load_dotenv(_ROOT / ".env")
 
 from fastapi import FastAPI, Request, Response, BackgroundTasks
 
-from services.openai_service import extract_appointment_info
-from services.calendar_service import (
-    check_availability,
-    create_appointment,
-    find_existing_appointment,
-    SERVICE_DISPLAY_NAMES,
-)
+from services.openai_service import process_lead_message
 from services.whatsapp_service import send_message
 from services.state_service import (
     get_state,
@@ -43,67 +37,140 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-app = FastAPI(title="WhatsApp Calendar Agent")
+app = FastAPI(title="WhatsApp Calendar Agent — Lead Qualification Mode")
 
 _verify_token_loaded = bool(os.environ.get("META_VERIFY_TOKEN"))
 logger.info(f"META_VERIFY_TOKEN loaded: {_verify_token_loaded}")
 
 
-# ── Conversation constants ────────────────────────────────────────────────────
+# ── Phase field requirements ──────────────────────────────────────────────────
 
-REQUIRED_FIELDS = [
-    "customer_name",
-    "vehicle",
-    "plate",
-    "service_type",
-    "appointment_date",
-    "start_time",
-]
-
-FOLLOW_UP_QUESTIONS = {
-    "customer_name": "¿Cuál es tu nombre completo? 👤",
-    "vehicle": "¿Qué vehículo tienes? Por ejemplo: Toyota Corolla 🚗",
-    "plate": "¿Me puedes pasar la placa del vehículo? 🔢",
-    "service_type": (
-        "¿Qué servicio necesitas? 🔧\n"
-        "1️⃣ Mantenimiento preventivo\n"
-        "2️⃣ Diagnóstico técnico"
-    ),
-    "appointment_date": "¿Para qué fecha quieres la cita? 📅 (ej. mañana, lunes, 15 de mayo)",
-    "start_time": "¿A qué hora prefieres la cita? 🕐 (ej. 10am, 3:30pm)",
+PHASE_FIELDS = {
+    1: ["lead_name", "property_type"],
+    2: ["usage_intent", "urgency"],
+    3: {
+        "terrain": ["zone", "min_area_m2", "needs_services", "needs_title"],
+        "other": ["zone", "bedrooms_or_area", "essential_feature"],
+    },
+    4: ["budget_range", "payment_method"],
+    5: ["decision_maker", "available_for_visit"],
 }
 
 
-# ── Reply builders ────────────────────────────────────────────────────────────
+def _get_phase_fields(phase: int, is_terrain: bool = False) -> list[str]:
+    if phase == 3:
+        return PHASE_FIELDS[3]["terrain"] if is_terrain else PHASE_FIELDS[3]["other"]
+    return PHASE_FIELDS.get(phase, [])
 
-def _build_confirmation_reply(appointment: dict, event: dict) -> str:
-    service_display = SERVICE_DISPLAY_NAMES.get(
-        appointment.get("service_type", ""),
-        appointment.get("service_type", "Servicio"),
+
+def _compute_current_phase(lead_data: dict, is_terrain: bool) -> int:
+    """Determine the earliest incomplete phase (1-5). Returns 6 if all complete."""
+    for phase in range(1, 6):
+        fields = _get_phase_fields(phase, is_terrain)
+        missing = [f for f in fields if not lead_data.get(f)]
+        if missing:
+            return phase
+    return 6
+
+
+# ── Lead evaluation ───────────────────────────────────────────────────────────
+
+def _evaluate_lead(lead_data: dict) -> tuple[bool, int, dict]:
+    """Evaluate lead against 7 criteria. Returns (is_qualified, score, detail)."""
+    criteria = {
+        "intencion_clara": bool(lead_data.get("usage_intent")),
+        "urgencia": lead_data.get("urgency") in ("alta", "media"),
+        "zona_definida": bool(lead_data.get("zone")),
+        "presupuesto_real": bool(lead_data.get("budget_range")),
+        "capacidad_pago": bool(lead_data.get("payment_method")),
+        "tomador_decision": bool(lead_data.get("decision_maker")),
+        "disponibilidad": (
+            lead_data.get("available_for_visit") is True
+            or bool(lead_data.get("contact_info"))
+        ),
+    }
+
+    score = sum(1 for v in criteria.values() if v)
+    is_qualified = score >= 5
+    return is_qualified, score, criteria
+
+
+def _determine_rejection_reason(lead_data: dict) -> str:
+    """Return the letter (A-D) for the primary rejection reason."""
+    if lead_data.get("urgency") == "baja" or not lead_data.get("urgency"):
+        return "A"
+    if not lead_data.get("budget_range"):
+        return "B"
+    if not lead_data.get("decision_maker"):
+        return "C"
+    return "D"
+
+
+def _send_qualified_closing(phone: str, lead_data: dict) -> None:
+    """Send closing message for qualified leads and log structured summary."""
+    name = lead_data.get("lead_name", "estimado/a")
+    contact = lead_data.get("contact_info") or phone
+
+    message = (
+        f"¡Muchas gracias, {name}! Con la información que me has dado, "
+        f"creo que tenemos opciones que pueden interesarte mucho. Voy a pasar "
+        f"tu consulta a uno de nuestros asesores especializados, quien se "
+        f"comunicará contigo a la brevedad al {contact}. ¡Que tengas un excelente día!"
     )
+    send_message(phone, message)
 
-    lines = [
-        "✅ ¡Cita creada correctamente!",
-        "",
-        f"📅 Fecha: {appointment['appointment_date']}",
-        f"🕐 Hora: {appointment['start_time']}",
-        f"🔧 Servicio: {service_display}",
-        f"👤 Cliente: {appointment['customer_name']}",
-        f"🚗 Vehículo: {appointment.get('vehicle', 'N/A')} — Placa: {appointment.get('plate', 'N/A')}",
-    ]
-
-    calendar_link = event.get("htmlLink")
-    meet_link = event.get("hangoutLink")
-
-    if calendar_link:
-        lines.append(f"\n📆 Calendario: {calendar_link}")
-    if meet_link:
-        lines.append(f"📹 Meet: {meet_link}")
-
-    return "\n".join(lines)
+    summary = (
+        f"LEAD CALIFICADO — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Nombre: {lead_data.get('lead_name', 'N/A')}\n"
+        f"Teléfono: {phone}\n"
+        f"Tipo de propiedad: {lead_data.get('property_type', 'N/A')}\n"
+        f"Uso previsto: {lead_data.get('usage_intent', 'N/A')}\n"
+        f"Urgencia: {lead_data.get('urgency', 'N/A')}\n"
+        f"Zona de interés: {lead_data.get('zone', 'N/A')}\n"
+        f"Presupuesto: {lead_data.get('budget_range', 'N/A')}\n"
+        f"Forma de pago: {lead_data.get('payment_method', 'N/A')}\n"
+        f"Tomador de decisión: {lead_data.get('decision_maker', 'N/A')}\n"
+        f"Disponibilidad para visita: {'Sí' if lead_data.get('available_for_visit') else 'No informado'}\n"
+        f"Criterios cumplidos: X / 7\n"
+        f"Notas adicionales: {lead_data.get('urgency_comment', 'N/A')}"
+    )
+    logger.info(f"\n{'='*60}\n{summary}\n{'='*60}")
 
 
-# ── Core message processing — stateful, multi-turn ───────────────────────────
+def _send_non_qualified_closing(phone: str, lead_data: dict, reason: str) -> None:
+    """Send closing message for non-qualified leads."""
+    name = lead_data.get("lead_name", "estimado/a")
+
+    messages = {
+        "A": (
+            f"Entendido, {name}. Cuando estés más cerca de tomar la decisión, "
+            f"con gusto te ayudamos a encontrar la opción ideal. Mientras tanto, "
+            f"¿te gustaría que te mantengamos informado sobre nuevas propiedades "
+            f"disponibles que se ajusten a lo que buscas?"
+        ),
+        "B": (
+            f"Entendemos tu situación, {name}. Por el momento no contamos con "
+            f"opciones dentro de ese rango, pero nuestro portafolio cambia "
+            f"constantemente. ¿Podemos incluirte en nuestra lista de novedades "
+            f"para avisarte cuando tengamos algo que se ajuste?"
+        ),
+        "C": (
+            f"Perfecto, {name}. Cuando puedas conversar con "
+            f"{lead_data.get('decision_involves', 'la persona que decide')}, "
+            f"con gusto agendamos una llamada con los dos para explicarles "
+            f"todo con detalle. ¿Cuándo sería un buen momento?"
+        ),
+        "D": (
+            f"Sin problema, {name}. Si en algún momento decides avanzar o "
+            f"tienes alguna duda, aquí estaremos. ¿Hay algo más en lo que te "
+            f"pueda ayudar por ahora?"
+        ),
+    }
+
+    send_message(phone, messages.get(reason, messages["D"]))
+
+
+# ── Core message processing — multi-turn lead qualification ──────────────────
 
 def _process_message(phone_number: str, text: str, message_id: str | None) -> None:
     # ── Idempotency check ─────────────────────────────────────────────────────
@@ -116,72 +183,83 @@ def _process_message(phone_number: str, text: str, message_id: str | None) -> No
     try:
         logger.info(f"Processing message — phone={phone_number} id={message_id} text={text!r}")
 
-        # 1. Load accumulated data for this user
+        # 1. Load accumulated state for this user
         state = get_state(phone_number)
 
-        # 2. Extract whatever OpenAI can find in this new message
-        newly_extracted = extract_appointment_info(text)
-
-        # 3. Merge into accumulated state (non-None values win)
-        merged = merge_data(state.data, newly_extracted)
-
-        # 4. Tag with the WhatsApp sender phone so calendar can detect duplicates
-        merged["whatsapp_phone"] = phone_number
-
-        # 5. Find the first required field that is still missing
-        missing = [f for f in REQUIRED_FIELDS if not merged.get(f)]
-
-        if missing:
-            state.data = merged
-            state.stage = "collecting_info"
-            save_state(phone_number, state)
-
-            next_field = missing[0]
-            logger.info(f"Missing fields for {phone_number}: {missing} — asking for {next_field!r}")
-            send_message(phone_number, FOLLOW_UP_QUESTIONS[next_field])
+        # 2. If already evaluated, ignore new messages (or restart)
+        if state.stage == "done":
+            logger.info(f"Lead already evaluated for {phone_number} — ignoring")
             return
 
-        # 6. All required fields collected
-        logger.info(f"All fields collected for {phone_number} — checking for existing appointment")
-        state.stage = "ready_to_create"
+        # 3. Process message through OpenAI — get response + extracted data
+        result = process_lead_message(
+            message_text=text,
+            accumulated_data=state.data,
+            current_phase=state.phase,
+            retry_count=state.retry_count,
+            is_terrain=state.is_terrain,
+        )
 
-        # Check for an existing event for this phone+time BEFORE the general
-        # availability check. If the user already has a booking at this slot,
-        # check_availability would return False (slot busy) and wrongly ask for
-        # a new time, so we short-circuit here instead.
-        existing_event = find_existing_appointment(merged)
-        if existing_event:
-            logger.info(f"Existing appointment confirmed for {phone_number} — sending confirmation")
-            reply = _build_confirmation_reply(merged, existing_event)
-            send_message(phone_number, reply)
+        agent_response = result["agent_response"]
+        extracted = result["extracted"]
+
+        # 4. Merge extracted data into accumulated state
+        merged = merge_data(state.data, extracted)
+        merged["phone"] = phone_number
+
+        # 5. Detect if property_type was newly set to "terreno"
+        if not state.is_terrain and merged.get("property_type") == "terreno":
+            state.is_terrain = True
+            logger.info(f"Terrain flow activated for {phone_number}")
+
+        # 6. Determine current phase from accumulated data
+        new_phase = _compute_current_phase(merged, state.is_terrain)
+
+        # 7. Track retries: if phase hasn't advanced and no new data, increment
+        phase_advanced = new_phase > state.phase
+        had_new_data = any(
+            extracted.get(k) is not None
+            for k in _get_phase_fields(state.phase, state.is_terrain)
+        )
+
+        if not phase_advanced and not had_new_data:
+            state.retry_count += 1
+            logger.info(f"Retry increment for {phone_number} — count={state.retry_count}")
+        elif phase_advanced:
+            state.retry_count = 0
+
+        # 8. If retry limit reached (2), skip current phase fields
+        if state.retry_count >= 2:
+            logger.info(f"Retry limit reached for {phone_number} — skipping phase {state.phase}")
+            state.retry_count = 0
+
+        # 9. Save updated state
+        state.data = merged
+        state.phase = new_phase if new_phase <= 5 else 5
+
+        # 10. Check if all 5 phases are complete → evaluate
+        if new_phase >= 6:
+            logger.info(f"All phases complete for {phone_number} — evaluating lead")
+            is_qualified, score, criteria = _evaluate_lead(merged)
+
+            if is_qualified:
+                _send_qualified_closing(phone_number, merged)
+            else:
+                reason = _determine_rejection_reason(merged)
+                _send_non_qualified_closing(phone_number, merged, reason)
+
+            state.stage = "done"
+            save_state(phone_number, state)
             clear_state(phone_number)
-            return
-
-        logger.info(f"No existing event — checking general calendar availability")
-        is_available = check_availability(merged)
-
-        if not is_available:
-            merged["appointment_date"] = None
-            merged["start_time"] = None
-            state.data = merged
-            state.stage = "collecting_info"
-            save_state(phone_number, state)
-            logger.info(f"Slot busy for {phone_number} — asking for alternative time")
-            send_message(
-                phone_number,
-                "⚠️ Ya hay una cita en ese horario. ¿Qué otro horario te queda bien? 📅",
+            logger.info(
+                f"Lead evaluation complete — phone={phone_number} "
+                f"qualified={is_qualified} score={score}/7"
             )
             return
 
-        # 7. Create the calendar event (also duplicate-safe inside create_appointment)
-        event = create_appointment(merged)
-        logger.info(f"Calendar event ready for {phone_number} — id={event.get('id')}")
-
-        reply = _build_confirmation_reply(merged, event)
-        send_message(phone_number, reply)
-
-        # 8. Conversation complete — reset state
-        clear_state(phone_number)
+        # 11. Still qualifying — send AI-generated response
+        save_state(phone_number, state)
+        send_message(phone_number, agent_response)
 
     except Exception as e:
         logger.error(

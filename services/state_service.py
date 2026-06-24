@@ -1,5 +1,5 @@
 """
-Per-user conversation state for multi-turn appointment booking.
+Per-user conversation state for multi-turn lead qualification.
 Uses SQLite so state survives server restarts.
 Also tracks processed WhatsApp message IDs for idempotency.
 """
@@ -32,8 +32,11 @@ def _init_db() -> None:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS conversation_state (
                 phone       TEXT PRIMARY KEY,
-                stage       TEXT NOT NULL DEFAULT 'collecting_info',
+                stage       TEXT NOT NULL DEFAULT 'qualifying',
+                phase       INTEGER NOT NULL DEFAULT 1,
                 data        TEXT NOT NULL DEFAULT '{}',
+                is_terrain  INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
                 updated_at  TEXT NOT NULL
             )
         """)
@@ -53,7 +56,10 @@ _init_db()
 @dataclass
 class UserState:
     data: dict = field(default_factory=dict)
-    stage: str = "collecting_info"
+    stage: str = "qualifying"
+    phase: int = 1
+    is_terrain: bool = False
+    retry_count: int = 0
 
 
 # ── Conversation state ────────────────────────────────────────────────────────
@@ -62,11 +68,17 @@ def get_state(phone: str) -> UserState:
     with _lock:
         with _connect() as conn:
             row = conn.execute(
-                "SELECT stage, data FROM conversation_state WHERE phone = ?",
+                "SELECT stage, phase, data, is_terrain, retry_count FROM conversation_state WHERE phone = ?",
                 (phone,),
             ).fetchone()
     if row:
-        return UserState(stage=row["stage"], data=json.loads(row["data"]))
+        return UserState(
+            stage=row["stage"],
+            phase=row["phase"],
+            data=json.loads(row["data"]),
+            is_terrain=bool(row["is_terrain"]),
+            retry_count=row["retry_count"],
+        )
     return UserState()
 
 
@@ -75,17 +87,31 @@ def save_state(phone: str, state: UserState) -> None:
         with _connect() as conn:
             conn.execute(
                 """
-                INSERT INTO conversation_state (phone, stage, data, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO conversation_state (phone, stage, phase, data, is_terrain, retry_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(phone) DO UPDATE SET
-                    stage      = excluded.stage,
-                    data       = excluded.data,
-                    updated_at = excluded.updated_at
+                    stage       = excluded.stage,
+                    phase       = excluded.phase,
+                    data        = excluded.data,
+                    is_terrain  = excluded.is_terrain,
+                    retry_count = excluded.retry_count,
+                    updated_at  = excluded.updated_at
                 """,
-                (phone, state.stage, json.dumps(state.data), datetime.utcnow().isoformat()),
+                (
+                    phone,
+                    state.stage,
+                    state.phase,
+                    json.dumps(state.data),
+                    int(state.is_terrain),
+                    state.retry_count,
+                    datetime.utcnow().isoformat(),
+                ),
             )
             conn.commit()
-    logger.debug(f"State saved — phone={phone} stage={state.stage} fields={list(state.data.keys())}")
+    logger.debug(
+        f"State saved — phone={phone} stage={state.stage} phase={state.phase} "
+        f"fields={list(state.data.keys())}"
+    )
 
 
 def clear_state(phone: str) -> None:

@@ -1,6 +1,5 @@
 import os
 import json
-from datetime import date, timedelta
 from typing import Optional
 from openai import OpenAI
 
@@ -18,128 +17,222 @@ def _get_client() -> OpenAI:
         _client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
     return _client
 
-# Structured output schema for appointment extraction
-EXTRACTION_SCHEMA = {
-    "name": "appointment_extraction",
+
+AGENT_RESPONSE_SCHEMA = {
+    "name": "lead_agent_response",
     "strict": True,
     "schema": {
         "type": "object",
         "properties": {
-            "customer_name": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Nombre completo del cliente",
+            "agent_response": {
+                "type": "string",
+                "description": "Tu respuesta conversacional al lead. Una sola pregunta. Sigue el flujo de fases obligatorio.",
             },
-            "vehicle": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Marca y modelo del vehículo (ej. 'Toyota Corolla')",
-            },
-            "plate": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Placa del vehículo en mayúsculas sin espacios (ej. 'ABC123')",
-            },
-            "service_type": {
-                "anyOf": [
-                    {
-                        "type": "string",
-                        "enum": ["preventive_maintenance", "technical_diagnostics"],
+            "extracted": {
+                "type": "object",
+                "properties": {
+                    "lead_name": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Nombre completo del lead",
                     },
-                    {"type": "null"},
+                    "property_type": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": [
+                                    "casa",
+                                    "departamento",
+                                    "terreno",
+                                    "local_comercial",
+                                    "otro",
+                                ],
+                            },
+                            {"type": "null"},
+                        ],
+                        "description": "Tipo de propiedad que busca",
+                    },
+                    "usage_intent": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Para qué usará la propiedad: vivienda propia, inversión, negocio, otro",
+                    },
+                    "urgency": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "enum": ["alta", "media", "baja"],
+                            },
+                            {"type": "null"},
+                        ],
+                        "description": "Urgencia de compra: alta (<3 meses), media (3-6 meses), baja (>6 meses o explorando)",
+                    },
+                    "urgency_comment": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Plazo aproximado o comentario textual sobre urgencia",
+                    },
+                    "zone": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Zona, distrito o ubicación de interés",
+                    },
+                    "bedrooms_or_area": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Número de dormitorios o metraje deseado (para no-terrenos)",
+                    },
+                    "essential_feature": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Característica indispensable que debe tener la propiedad",
+                    },
+                    "min_area_m2": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Área mínima en metros cuadrados (para terrenos)",
+                    },
+                    "needs_services": {
+                        "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                        "description": "Si necesita servicios básicos (agua, luz, desagüe) en el terreno",
+                    },
+                    "needs_title": {
+                        "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                        "description": "Si requiere título de propiedad inscrito en Registros Públicos",
+                    },
+                    "budget_range": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Rango de presupuesto aproximado para la compra",
+                    },
+                    "payment_method": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Cómo planea financiar: recursos propios, crédito hipotecario, combinación",
+                    },
+                    "decision_maker": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Quién toma la decisión de compra",
+                    },
+                    "decision_involves": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Persona involucrada en la decisión: pareja, socio, familiar u otro",
+                    },
+                    "available_for_visit": {
+                        "anyOf": [{"type": "boolean"}, {"type": "null"}],
+                        "description": "Si está disponible para visitar una propiedad próximamente",
+                    },
+                    "contact_info": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Mejor número o momento para que un asesor lo contacte",
+                    },
+                    "phase_completed": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                        "description": "Número de fase completada (1-5) o null si ninguna se completó en este mensaje",
+                    },
+                    "asked_count": {
+                        "anyOf": [{"type": "integer"}, {"type": "null"}],
+                        "description": "Número de veces que se ha preguntado la misma pregunta al lead (1, 2). Usar para detectar evasivas.",
+                    },
+                },
+                "required": [
+                    "lead_name",
+                    "property_type",
+                    "usage_intent",
+                    "urgency",
+                    "urgency_comment",
+                    "zone",
+                    "bedrooms_or_area",
+                    "essential_feature",
+                    "min_area_m2",
+                    "needs_services",
+                    "needs_title",
+                    "budget_range",
+                    "payment_method",
+                    "decision_maker",
+                    "decision_involves",
+                    "available_for_visit",
+                    "contact_info",
+                    "phase_completed",
+                    "asked_count",
                 ],
-                "description": "Tipo de servicio: preventive_maintenance o technical_diagnostics",
-            },
-            "appointment_date": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Fecha de la cita en formato YYYY-MM-DD",
-            },
-            "start_time": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Hora de inicio en formato HH:MM (24h)",
-            },
-            "estimated_end_time": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Hora de fin estimada en formato HH:MM (24h)",
-            },
-            "phone": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Número de teléfono del cliente si se menciona",
-            },
-            "notes": {
-                "anyOf": [{"type": "string"}, {"type": "null"}],
-                "description": "Notas adicionales relevantes",
+                "additionalProperties": False,
             },
         },
-        "required": [
-            "customer_name",
-            "vehicle",
-            "plate",
-            "service_type",
-            "appointment_date",
-            "start_time",
-            "estimated_end_time",
-            "phone",
-            "notes",
-        ],
+        "required": ["agent_response", "extracted"],
         "additionalProperties": False,
     },
 }
 
 
-def extract_appointment_info(message_text: str) -> dict:
+def process_lead_message(
+    message_text: str,
+    accumulated_data: dict | None = None,
+    current_phase: int = 1,
+    retry_count: int = 0,
+    is_terrain: bool = False,
+) -> dict:
     """
-    Use OpenAI structured outputs to extract appointment data from a free-form
-    Spanish WhatsApp message sent by a mechanic.
-    Returns a dict with all schema fields (values may be None if not found).
-    """
-    today = date.today()
-    tomorrow = today + timedelta(days=1)
-    day_after = today + timedelta(days=2)
+    Process a WhatsApp message from a lead and return both a conversational
+    response and extracted structured data.
 
-    system_prompt = build_prompt(
-        today=today.strftime("%Y-%m-%d"),
-        tomorrow=tomorrow.strftime("%Y-%m-%d"),
-        day_after_tomorrow=day_after.strftime("%Y-%m-%d"),
+    Args:
+        message_text: The incoming WhatsApp message from the lead.
+        accumulated_data: Previously accumulated lead data (or None).
+        current_phase: Current qualification phase (1-5).
+        retry_count: Number of times the current question has been asked.
+
+    Returns:
+        dict with keys: agent_response (str), extracted (dict)
+    """
+    system_prompt = build_prompt()
+
+    accumulated_json = json.dumps(accumulated_data or {}, ensure_ascii=False)
+    context = (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"DATOS ACUMULADOS DEL LEAD (hasta ahora):\n"
+        f"{accumulated_json}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"FASE ACTUAL: {current_phase}\n"
+        f"TIPO DE PROPIEDAD: {'terreno' if is_terrain else 'pendiente de determinar'}\n"
+        f"INTENTOS EN PREGUNTA ACTUAL: {retry_count}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"MENSAJE DEL LEAD:\n{message_text}"
     )
 
-    logger.info(f"Extracting appointment info from: {message_text!r}")
+    logger.info(
+        f"Processing lead message — phase={current_phase} accumulated={accumulated_json}"
+    )
 
     try:
         response = _get_client().chat.completions.create(
             model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message_text},
+                {"role": "user", "content": context},
             ],
             response_format={
                 "type": "json_schema",
-                "json_schema": EXTRACTION_SCHEMA,
+                "json_schema": AGENT_RESPONSE_SCHEMA,
             },
-            temperature=0,  # Deterministic for data extraction
+            temperature=0.3,
         )
 
         raw = response.choices[0].message.content
-        appointment = json.loads(raw)
-        logger.info(f"Extracted appointment data: {appointment}")
-        return appointment
+        result = json.loads(raw)
+        logger.info(f"Lead agent response: agent_response={result['agent_response'][:80]!r}")
+        logger.debug(f"Full extracted data: {result['extracted']}")
+        return result
 
     except Exception as e:
-        logger.error(f"OpenAI extraction failed: {e}", exc_info=True)
+        logger.error(f"OpenAI lead processing failed: {e}", exc_info=True)
         raise
 
 
-def get_missing_required_fields(appointment: dict) -> list[str]:
-    """Return list of human-readable Spanish field names that are missing."""
-    required = {
-        "customer_name": "nombre del cliente",
-        "vehicle": "vehículo",
-        "plate": "placa",
-        "service_type": "tipo de servicio",
-        "appointment_date": "fecha",
-        "start_time": "hora",
+def get_missing_lead_fields(lead_data: dict, phase: int, is_terrain: bool) -> list[str]:
+    """Return list of field names still needed for the current phase."""
+    phase_fields = {
+        1: ["lead_name", "property_type"],
+        2: ["usage_intent", "urgency"],
+        3: (
+            ["zone", "min_area_m2", "needs_services", "needs_title"]
+            if is_terrain
+            else ["zone", "bedrooms_or_area", "essential_feature"]
+        ),
+        4: ["budget_range", "payment_method"],
+        5: ["decision_maker", "available_for_visit"],
     }
 
-    missing = []
-    for field, label in required.items():
-        if not appointment.get(field):
-            missing.append(label)
-
-    return missing
+    required = phase_fields.get(phase, [])
+    return [f for f in required if not lead_data.get(f)]

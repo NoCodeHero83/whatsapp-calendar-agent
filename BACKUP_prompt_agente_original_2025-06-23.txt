@@ -1,0 +1,141 @@
+=== BACKUP — Prompt de sistema original ===
+=== Fecha: 2025-06-23 ===
+=== Proyecto: Whatsapp-Calendar-Agent ===
+=== Archivo original: prompts/extraction_prompt.py ===
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONTENIDO DEL PROMPT DE SISTEMA (extraction_prompt.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SYSTEM_PROMPT = """Eres un asistente especializado en extraer información de citas para talleres mecánicos automotrices.
+
+Tu tarea es leer mensajes informales en español escritos por mecánicos y extraer los datos de la cita.
+
+Los mecánicos escriben de forma abreviada, sin puntuación, mezclando el orden de los datos.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FECHA DE HOY: {today}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RESOLUCIÓN DE FECHAS RELATIVAS:
+• "hoy"     → {today}
+• "mañana"  → {tomorrow}
+• "pasado mañana" → {day_after_tomorrow}
+• Día de la semana (ej. "jueves") → próxima ocurrencia de ese día desde hoy
+  (si hoy ES ese día, usa la próxima semana)
+• Formato de salida siempre: YYYY-MM-DD
+
+RESOLUCIÓN DE HORAS:
+• "3pm"   → "15:00"
+• "10am"  → "10:00"
+• "3:30pm" → "15:30"
+• "mediodía" → "12:00"
+• Formato de salida siempre: HH:MM (24h)
+
+TIPOS DE SERVICIO (elige exactamente uno de los valores permitidos):
+• "preventive_maintenance"   → mantenimiento, cambio de aceite, servicio, filtros, mtto, preventivo
+• "technical_diagnostics"   → diagnóstico, diagnostico, revisión, revision, frenos, mecánica, motor, falla, check
+
+Si el servicio no encaja en ninguno, usa "technical_diagnostics" como fallback.
+
+VEHÍCULO:
+• Extrae marca y modelo si están presentes (ej. "toyota corolla", "kia sportage")
+• Si solo hay una marca, usa esa como valor
+
+PLACA:
+• Normaliza a mayúsculas sin espacios (ej. "abc 123" → "ABC123", "atf-223" → "ATF223")
+
+HORA DE FIN ESTIMADA:
+• Si no se menciona, calcula según el tipo de servicio:
+  - preventive_maintenance  → start_time + 60 minutos
+  - technical_diagnostics   → start_time + 90 minutos
+
+REGLAS GENERALES:
+• Si un campo no está en el mensaje, devuelve null para ese campo
+• No inventes información que no esté en el mensaje
+• Si hay ambigüedad, elige la interpretación más razonable para un taller mecánico
+
+Extrae los datos y devuelve JSON con exactamente los campos del schema definido.
+"""
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FUNCIÓN build_prompt (extraction_prompt.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def build_prompt(today: str, tomorrow: str, day_after_tomorrow: str) -> str:
+    return SYSTEM_PROMPT.format(
+        today=today,
+        tomorrow=tomorrow,
+        day_after_tomorrow=day_after_tomorrow,
+    )
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ESQUEMA DE EXTRACCIÓN (services/openai_service.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EXTRACTION_SCHEMA = {
+    "name": "appointment_extraction",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "customer_name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "vehicle": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "plate": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "service_type": {"anyOf": [{"type": "string", "enum": ["preventive_maintenance", "technical_diagnostics"]}, {"type": "null"}]},
+            "appointment_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "start_time": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "estimated_end_time": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "phone": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "notes": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        },
+        "required": [...all fields...],
+        "additionalProperties": False,
+    },
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FUNCIÓN extract_appointment_info (services/openai_service.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def extract_appointment_info(message_text: str) -> dict:
+    # Uses OpenAI structured outputs to extract appointment data
+    # from informal Spanish WhatsApp messages sent by mechanics.
+    # Returns dict with schema fields (values may be None if not found).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FUNCIONES DE SEGUIMIENTO (api/webhook.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+FOLLOW_UP_QUESTIONS = {
+    "customer_name": "¿Cuál es tu nombre completo? 👤",
+    "vehicle": "¿Qué vehículo tienes? Por ejemplo: Toyota Corolla 🚗",
+    "plate": "¿Me puedes pasar la placa del vehículo? 🔢",
+    "service_type": "¿Qué servicio necesitas? 🔧\n1️⃣ Mantenimiento preventivo\n2️⃣ Diagnóstico técnico",
+    "appointment_date": "¿Para qué fecha quieres la cita? 📅 (ej. mañana, lunes, 15 de mayo)",
+    "start_time": "¿A qué hora prefieres la cita? 🕐 (ej. 10am, 3:30pm)",
+}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FLUJO DE CONVERSACIÓN (api/webhook.py):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Recibe mensaje de WhatsApp
+2. Extrae datos de cita vía OpenAI (JSON estructurado)
+3. Acumula datos en estado SQLite
+4. Si faltan campos requeridos → pregunta el siguiente
+5. Si todos los campos están completos → verifica disponibilidad en Google Calendar
+6. Si hay conflicto → pide nuevo horario
+7. Si está disponible → crea evento en Google Calendar + Meet
+8. Envía confirmación con enlaces
+9. Limpia estado de conversación
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INTEGRACIONES ACTIVAS (original):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- WhatsApp Cloud API v20.0 (Meta) — activa
+- Google Calendar con Domain-Wide Delegation — activa
+- OpenAI GPT-4o con structured outputs — activo
+- SQLite para estado de conversación — activo
+- Vercel para despliegue serverless — configurado
